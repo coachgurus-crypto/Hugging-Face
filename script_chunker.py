@@ -185,55 +185,40 @@ def _is_action_start(words, idx):
     return False
 
 
-def _is_action_token(word):
-    token = _normalize_token(word)
-    if token in ACTION_VERB_WORDS or token in VISUAL_CUE_WORDS:
+def _is_action_clause_start(words, idx, scene_start_idx):
+    """Detect starts of a new action clause (subject + verb pattern)."""
+    if idx >= len(words):
+        return False
+
+    token_raw = words[idx]
+    token = _normalize_token(token_raw)
+
+    if token in ACTION_SUBJECT_WORDS and idx + 1 < len(words):
+        next_token = _normalize_token(words[idx + 1])
+        return next_token in ACTION_VERB_WORDS
+
+    # Name + action verb, e.g. "Chike grabbed"
+    if token_raw and token_raw[0].isupper() and idx + 1 < len(words):
+        next_token = _normalize_token(words[idx + 1])
+        if next_token in ACTION_VERB_WORDS:
+            return True
+
+    # Allow imperative/verb-led opening at start of a scene.
+    if idx == scene_start_idx and token in ACTION_VERB_WORDS:
         return True
+
     return False
 
 
-def _find_split_before_action_limit(words, start_idx, end_idx, max_actions=1):
-    action_count = 0
-    idx = start_idx
-    while idx < end_idx:
-        token = _normalize_token(words[idx])
-
-        if token in ACTION_SUBJECT_WORDS and idx + 1 < end_idx:
-            next_token = _normalize_token(words[idx + 1])
-            if next_token in ACTION_VERB_WORDS:
-                action_count += 1
-                if action_count > max_actions:
-                    return idx
-                idx += 2
-                continue
-
-        if _is_action_token(words[idx]):
-            action_count += 1
-            if action_count > max_actions:
+def _find_second_action_clause_start(words, start_idx, end_idx):
+    """Return index where the second action clause starts within the range."""
+    action_clause_count = 0
+    for idx in range(start_idx, end_idx):
+        if _is_action_clause_start(words, idx, start_idx):
+            action_clause_count += 1
+            if action_clause_count >= 2:
                 return idx
-
-        idx += 1
     return None
-
-
-def _trim_trailing_connectors(words, scene_start, split_at):
-    while split_at > scene_start:
-        prev = _normalize_token(words[split_at - 1])
-        if prev in {"and", "then", "but", "so"}:
-            split_at -= 1
-            continue
-        break
-    return split_at
-
-
-def _strip_leading_connectors(scene_words):
-    while len(scene_words) > 1:
-        first = _normalize_token(scene_words[0])
-        if first in {"and", "then", "but", "so"}:
-            scene_words = scene_words[1:]
-            continue
-        break
-    return scene_words
 
 
 def _find_action_start(words, start_idx, end_idx):
@@ -276,6 +261,31 @@ def _merge_short_non_action_scenes(scene_word_chunks, min_words=6):
     return merged
 
 
+def _merge_non_action_leadins(scene_word_chunks):
+    if not scene_word_chunks:
+        return scene_word_chunks
+
+    merged = []
+    i = 0
+    while i < len(scene_word_chunks):
+        current = scene_word_chunks[i]
+        if i + 1 < len(scene_word_chunks):
+            nxt = scene_word_chunks[i + 1]
+            current_last = current[-1] if current else ""
+            if (
+                current
+                and not _scene_has_action(current)
+                and _scene_has_action(nxt)
+                and not current_last.endswith((".", "!", "?", ";"))
+            ):
+                merged.append(current + nxt)
+                i += 2
+                continue
+        merged.append(current)
+        i += 1
+    return merged
+
+
 def split_into_scenes_contextual(
     text,
     words_per_scene=11,
@@ -295,7 +305,7 @@ def split_into_scenes_contextual(
         return []
 
     if min_words is None:
-        min_words = max(6, words_per_scene - 3)
+        min_words = 6
     if max_words is None:
         max_words = max(words_per_scene + 6, min_words + 2)
 
@@ -334,19 +344,17 @@ def split_into_scenes_contextual(
             if split_at <= idx:
                 split_at = total
 
-        # Keep scenes visually focused: do not allow more than 1 action.
-        action_limit_split = _find_split_before_action_limit(words, idx, split_at, max_actions=1)
-        if action_limit_split is not None and action_limit_split > idx:
-            candidate_split = _trim_trailing_connectors(words, idx, action_limit_split)
-            # Avoid tiny scenes like "He opened the" / "walked inside."
-            # If too short, wait for punctuation/next natural boundary.
-            if (candidate_split - idx) >= min_words:
-                split_at = candidate_split
+        # One action clause per scene: split where the second clause starts.
+        second_action_clause = _find_second_action_clause_start(words, idx, split_at)
+        action_clause_min_words = max(4, min_words - 2)
+        if second_action_clause is not None and (second_action_clause - idx) >= action_clause_min_words:
+            split_at = second_action_clause
 
-        scenes.append(_strip_leading_connectors(words[idx:split_at]))
+        scenes.append(words[idx:split_at])
         idx = split_at
 
     scenes = _merge_short_non_action_scenes(scenes, min_words=min_words)
+    scenes = _merge_non_action_leadins(scenes)
 
     formatted_scenes = []
     for scene_words in scenes:
