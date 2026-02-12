@@ -8,6 +8,12 @@ Adds [SCENE XXX] markers every 10-12 words for precise image generation
 import re
 import sys
 
+try:
+    import spacy
+except ImportError:
+    spacy = None
+
+_SPACY_NLP = None
 
 VISUAL_CUE_WORDS = {
     "appears",
@@ -147,6 +153,29 @@ def split_into_scenes(text, words_per_scene=11):
 
 def _normalize_token(word):
     return re.sub(r"^[^\w]+|[^\w]+$", "", word).lower()
+
+
+def _get_spacy_nlp():
+    global _SPACY_NLP
+    if _SPACY_NLP is not None:
+        return _SPACY_NLP
+    if spacy is None:
+        return None
+
+    nlp = spacy.blank("en")
+    if "sentencizer" not in nlp.pipe_names:
+        nlp.add_pipe("sentencizer")
+    _SPACY_NLP = nlp
+    return _SPACY_NLP
+
+
+def _split_sentences(text):
+    nlp = _get_spacy_nlp()
+    if nlp is None:
+        # Fallback when spaCy is unavailable.
+        return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    doc = nlp(text)
+    return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
 
 
 def _find_cue_index(words, start_idx, end_idx):
@@ -333,6 +362,53 @@ def _merge_non_action_leadins(scene_word_chunks, max_words):
     return merged
 
 
+def _rebalance_tiny_scene_starts(scene_word_chunks, max_words):
+    if not scene_word_chunks:
+        return scene_word_chunks
+
+    rebalanced = [scene_word_chunks[0]]
+    for current in scene_word_chunks[1:]:
+        prev = rebalanced[-1]
+        first_word = current[0] if current else ""
+        prev_last = prev[-1] if prev else ""
+        is_tiny = len(current) <= 3
+        starts_lower = bool(first_word) and first_word[0].islower()
+        prev_is_open = not prev_last.endswith((".", "!", "?", ";"))
+        can_attach = (len(prev) + len(current)) <= (max_words + 3)
+
+        # Avoid orphaned micro-scenes such as "real wife." / "years, Chike."
+        if (is_tiny or (starts_lower and prev_is_open)) and can_attach and not _scene_has_action(current):
+            rebalanced[-1] = prev + current
+        else:
+            rebalanced.append(current)
+    return rebalanced
+
+
+def _split_long_sentence_words(words, words_per_scene, min_words, max_words):
+    chunks = []
+    remaining = words[:]
+
+    while remaining:
+        if len(remaining) <= max_words:
+            chunks.append(remaining)
+            break
+
+        split_at = _find_soft_break_within_range(
+            words=remaining,
+            start_idx=0,
+            min_idx=min_words,
+            target_idx=min(words_per_scene, len(remaining) - 1),
+            max_idx=min(max_words, len(remaining)),
+        )
+        if split_at is None or split_at <= 0:
+            split_at = max_words
+
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+
+    return chunks
+
+
 def split_into_scenes_contextual(
     text,
     words_per_scene=11,
@@ -340,15 +416,8 @@ def split_into_scenes_contextual(
     min_words=None,
     max_words=None,
 ):
-    """
-    Split text using a hybrid strategy:
-    1) target a word count
-    2) prefer action/visual cue boundaries near the target
-    3) fallback to punctuation
-    4) hard split at max_words
-    """
-    words = text.split()
-    if not words:
+    """Split text with spaCy sentence boundaries + action-aware pacing."""
+    if not text or not text.strip():
         return []
 
     if min_words is None:
@@ -356,68 +425,60 @@ def split_into_scenes_contextual(
     if max_words is None:
         max_words = max(words_per_scene + 1, min_words + 1)
 
-    scenes = []
-    scene_number = 1
-    idx = 0
-    total = len(words)
-
-    while idx < total:
-        min_split = min(total, idx + min_words)
-        target_split = min(total, idx + words_per_scene)
-        hard_split = min(total, idx + max_words)
-
-        if target_split >= total:
-            split_at = total
-        else:
-            action_window_start = min(total, idx + 6)
-            action_window_end = min(total, target_split + lookahead + 1)
-            action_idx = _find_action_start(words, action_window_start, action_window_end)
-
-            cue_window_end = min(total, target_split + lookahead + 1)
-            cue_idx = _find_cue_index(words, target_split, cue_window_end)
-            punct_split = _find_punctuation_break(words, min_split, hard_split)
-
-            if action_idx is not None:
-                split_at = action_idx
-            elif punct_split is not None:
-                split_at = punct_split
-            elif cue_idx is not None and cue_idx >= min_split:
-                split_at = cue_idx
-            else:
-                split_at = hard_split
-
-        if split_at <= idx:
-            split_at = min(total, idx + words_per_scene)
-            if split_at <= idx:
-                split_at = total
-
-        # One action clause per scene: split where the second clause starts.
-        second_action_clause = _find_second_action_clause_start(words, idx, split_at)
-        action_clause_min_words = max(4, min_words - 2)
-        if second_action_clause is not None and (second_action_clause - idx) >= action_clause_min_words:
-            split_at = second_action_clause
-
-        # Enforce a tight word budget (e.g., 10-12 words) even for long clauses.
-        if (split_at - idx) > max_words:
-            min_idx = min(total, idx + min_words)
-            target_idx = min(total - 1, idx + words_per_scene)
-            max_idx = min(total, idx + max_words)
-            soft_break = _find_soft_break_within_range(
+    # 1) Sentence-first segmentation from spaCy.
+    sentence_units = []
+    for sentence in _split_sentences(text):
+        words = sentence.split()
+        if not words:
+            continue
+        if len(words) <= max_words:
+            sentence_units.append(words)
+            continue
+        sentence_units.extend(
+            _split_long_sentence_words(
                 words=words,
-                start_idx=idx,
-                min_idx=min_idx,
-                target_idx=target_idx,
-                max_idx=max_idx,
+                words_per_scene=words_per_scene,
+                min_words=min_words,
+                max_words=max_words,
             )
-            split_at = soft_break if soft_break is not None else max_idx
+        )
 
-        scenes.append(words[idx:split_at])
-        idx = split_at
+    if not sentence_units:
+        return []
 
-    scenes = _merge_short_non_action_scenes(scenes, min_words=min_words)
-    scenes = _merge_non_action_leadins(scenes, max_words=max_words)
+    # 2) Build scenes with one-action-clause preference + tight pacing.
+    scenes = []
+    current_scene = []
+    current_has_action = False
+
+    for unit in sentence_units:
+        unit_has_action = _scene_has_action(unit)
+        unit_len = len(unit)
+        current_len = len(current_scene)
+
+        if not current_scene:
+            current_scene = unit[:]
+            current_has_action = unit_has_action
+            continue
+
+        should_split_for_action = current_has_action and unit_has_action and current_len >= min_words
+        would_exceed_budget = (current_len + unit_len) > max_words
+
+        if should_split_for_action or would_exceed_budget:
+            scenes.append(current_scene)
+            current_scene = unit[:]
+            current_has_action = unit_has_action
+        else:
+            current_scene.extend(unit)
+            current_has_action = current_has_action or unit_has_action
+
+    if current_scene:
+        scenes.append(current_scene)
+
+    scenes = _rebalance_tiny_scene_starts(scenes, max_words=max_words)
 
     formatted_scenes = []
+    scene_number = 1
     for scene_words in scenes:
         scene_text = " ".join(scene_words)
         formatted_scenes.append(f"[SCENE {scene_number:03d}] {scene_text}")

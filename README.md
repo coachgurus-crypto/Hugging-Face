@@ -18,6 +18,7 @@ Split scripts into `[SCENE XXX]` chunks for storyboard generation.
 - Paste script text or upload a `.txt` file
 - Adjustable words-per-scene slider
 - Split mode toggle: `Basic` or `Context-Aware`
+- Context-Aware mode uses spaCy sentence segmentation
 - Copy output to clipboard
 - Download chunked output as a text file
 
