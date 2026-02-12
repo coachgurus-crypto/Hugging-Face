@@ -88,6 +88,9 @@ ACTION_VERB_WORDS = {
     "turned",
     "walked",
     "whispered",
+    "building",
+    "living",
+    "laughing",
 }
 
 
@@ -182,6 +185,57 @@ def _is_action_start(words, idx):
     return False
 
 
+def _is_action_token(word):
+    token = _normalize_token(word)
+    if token in ACTION_VERB_WORDS or token in VISUAL_CUE_WORDS:
+        return True
+    return False
+
+
+def _find_split_before_action_limit(words, start_idx, end_idx, max_actions=1):
+    action_count = 0
+    idx = start_idx
+    while idx < end_idx:
+        token = _normalize_token(words[idx])
+
+        if token in ACTION_SUBJECT_WORDS and idx + 1 < end_idx:
+            next_token = _normalize_token(words[idx + 1])
+            if next_token in ACTION_VERB_WORDS:
+                action_count += 1
+                if action_count > max_actions:
+                    return idx
+                idx += 2
+                continue
+
+        if _is_action_token(words[idx]):
+            action_count += 1
+            if action_count > max_actions:
+                return idx
+
+        idx += 1
+    return None
+
+
+def _trim_trailing_connectors(words, scene_start, split_at):
+    while split_at > scene_start:
+        prev = _normalize_token(words[split_at - 1])
+        if prev in {"and", "then", "but", "so"}:
+            split_at -= 1
+            continue
+        break
+    return split_at
+
+
+def _strip_leading_connectors(scene_words):
+    while len(scene_words) > 1:
+        first = _normalize_token(scene_words[0])
+        if first in {"and", "then", "but", "so"}:
+            scene_words = scene_words[1:]
+            continue
+        break
+    return scene_words
+
+
 def _find_action_start(words, start_idx, end_idx):
     for idx in range(start_idx, end_idx):
         if _is_action_start(words, idx):
@@ -210,6 +264,13 @@ def _merge_short_non_action_scenes(scene_word_chunks, min_words=6):
             if not (_scene_has_action(current) and _scene_has_action(nxt)):
                 current = current + nxt
                 i += 1
+        elif len(current) < min_words and merged:
+            prev = merged[-1]
+            # Merge tiny trailing/non-leading fragments back unless both are action beats.
+            if not (_scene_has_action(prev) and _scene_has_action(current)):
+                merged[-1] = prev + current
+                i += 1
+                continue
         merged.append(current)
         i += 1
     return merged
@@ -273,7 +334,16 @@ def split_into_scenes_contextual(
             if split_at <= idx:
                 split_at = total
 
-        scenes.append(words[idx:split_at])
+        # Keep scenes visually focused: do not allow more than 1 action.
+        action_limit_split = _find_split_before_action_limit(words, idx, split_at, max_actions=1)
+        if action_limit_split is not None and action_limit_split > idx:
+            candidate_split = _trim_trailing_connectors(words, idx, action_limit_split)
+            # Avoid tiny scenes like "He opened the" / "walked inside."
+            # If too short, wait for punctuation/next natural boundary.
+            if (candidate_split - idx) >= min_words:
+                split_at = candidate_split
+
+        scenes.append(_strip_leading_connectors(words[idx:split_at]))
         idx = split_at
 
     scenes = _merge_short_non_action_scenes(scenes, min_words=min_words)
