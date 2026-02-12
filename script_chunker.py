@@ -173,6 +173,52 @@ def _find_punctuation_break(words, start_idx, end_idx):
     return None
 
 
+def _find_soft_break_within_range(words, start_idx, min_idx, target_idx, max_idx):
+    """Find a natural break within a hard word budget."""
+    if min_idx >= max_idx:
+        return None
+
+    connector_tokens = {
+        "and",
+        "but",
+        "so",
+        "because",
+        "while",
+        "when",
+        "that",
+        "which",
+        "who",
+        "as",
+        "then",
+    }
+
+    # 1) Prefer sentence-ending punctuation near target.
+    for idx in range(min(target_idx, max_idx - 1), min_idx - 1, -1):
+        if words[idx].endswith((".", "!", "?", ";")):
+            return idx + 1
+    for idx in range(target_idx, max_idx):
+        if words[idx].endswith((".", "!", "?", ";")):
+            return idx + 1
+
+    # 2) Then comma/colon/dash boundaries.
+    for idx in range(min(target_idx, max_idx - 1), min_idx - 1, -1):
+        if words[idx].endswith((",", ":", ";", "-", "—")):
+            return idx + 1
+    for idx in range(target_idx, max_idx):
+        if words[idx].endswith((",", ":", ";", "-", "—")):
+            return idx + 1
+
+    # 3) Finally split before connectors.
+    for idx in range(target_idx, max_idx):
+        if _normalize_token(words[idx]) in connector_tokens and idx > start_idx + 2:
+            return idx
+    for idx in range(min(target_idx, max_idx - 1), min_idx, -1):
+        if _normalize_token(words[idx]) in connector_tokens and idx > start_idx + 2:
+            return idx
+
+    return None
+
+
 def _is_action_start(words, idx):
     if idx >= len(words):
         return False
@@ -261,7 +307,7 @@ def _merge_short_non_action_scenes(scene_word_chunks, min_words=6):
     return merged
 
 
-def _merge_non_action_leadins(scene_word_chunks):
+def _merge_non_action_leadins(scene_word_chunks, max_words):
     if not scene_word_chunks:
         return scene_word_chunks
 
@@ -277,6 +323,7 @@ def _merge_non_action_leadins(scene_word_chunks):
                 and not _scene_has_action(current)
                 and _scene_has_action(nxt)
                 and not current_last.endswith((".", "!", "?", ";"))
+                and (len(current) + len(nxt)) <= max_words
             ):
                 merged.append(current + nxt)
                 i += 2
@@ -305,9 +352,9 @@ def split_into_scenes_contextual(
         return []
 
     if min_words is None:
-        min_words = 6
+        min_words = max(6, words_per_scene - 2)
     if max_words is None:
-        max_words = max(words_per_scene + 6, min_words + 2)
+        max_words = max(words_per_scene + 1, min_words + 1)
 
     scenes = []
     scene_number = 1
@@ -350,11 +397,25 @@ def split_into_scenes_contextual(
         if second_action_clause is not None and (second_action_clause - idx) >= action_clause_min_words:
             split_at = second_action_clause
 
+        # Enforce a tight word budget (e.g., 10-12 words) even for long clauses.
+        if (split_at - idx) > max_words:
+            min_idx = min(total, idx + min_words)
+            target_idx = min(total - 1, idx + words_per_scene)
+            max_idx = min(total, idx + max_words)
+            soft_break = _find_soft_break_within_range(
+                words=words,
+                start_idx=idx,
+                min_idx=min_idx,
+                target_idx=target_idx,
+                max_idx=max_idx,
+            )
+            split_at = soft_break if soft_break is not None else max_idx
+
         scenes.append(words[idx:split_at])
         idx = split_at
 
     scenes = _merge_short_non_action_scenes(scenes, min_words=min_words)
-    scenes = _merge_non_action_leadins(scenes)
+    scenes = _merge_non_action_leadins(scenes, max_words=max_words)
 
     formatted_scenes = []
     for scene_words in scenes:
