@@ -44,6 +44,52 @@ VISUAL_CUE_PHRASES = (
     ("zoom", "out"),
 )
 
+ACTION_SUBJECT_WORDS = {
+    "he",
+    "she",
+    "they",
+    "we",
+    "i",
+    "you",
+    "chike",
+    "amara",
+    "adanna",
+    "zainab",
+}
+
+ACTION_VERB_WORDS = {
+    "asked",
+    "buzzed",
+    "called",
+    "checked",
+    "closed",
+    "crumpled",
+    "cut",
+    "demanded",
+    "entered",
+    "excused",
+    "grabbed",
+    "handed",
+    "interrupted",
+    "laughed",
+    "looked",
+    "moved",
+    "opened",
+    "paused",
+    "pointed",
+    "pulled",
+    "ran",
+    "revealed",
+    "said",
+    "showed",
+    "spun",
+    "stepped",
+    "stood",
+    "turned",
+    "walked",
+    "whispered",
+}
+
 
 def clean_text(text):
     """Remove script formatting markers and clean up text"""
@@ -124,6 +170,51 @@ def _find_punctuation_break(words, start_idx, end_idx):
     return None
 
 
+def _is_action_start(words, idx):
+    if idx >= len(words):
+        return False
+    token = _normalize_token(words[idx])
+    if token in ACTION_VERB_WORDS:
+        return True
+    if token in ACTION_SUBJECT_WORDS and idx + 1 < len(words):
+        next_token = _normalize_token(words[idx + 1])
+        return next_token in ACTION_VERB_WORDS
+    return False
+
+
+def _find_action_start(words, start_idx, end_idx):
+    for idx in range(start_idx, end_idx):
+        if _is_action_start(words, idx):
+            return idx
+    return None
+
+
+def _scene_has_action(scene_words):
+    for idx in range(len(scene_words)):
+        if _is_action_start(scene_words, idx):
+            return True
+    return False
+
+
+def _merge_short_non_action_scenes(scene_word_chunks, min_words=6):
+    if not scene_word_chunks:
+        return scene_word_chunks
+
+    merged = []
+    i = 0
+    while i < len(scene_word_chunks):
+        current = scene_word_chunks[i]
+        if len(current) < min_words and i + 1 < len(scene_word_chunks):
+            nxt = scene_word_chunks[i + 1]
+            # Preserve short action beats when consecutive action scenes are present.
+            if not (_scene_has_action(current) and _scene_has_action(nxt)):
+                current = current + nxt
+                i += 1
+        merged.append(current)
+        i += 1
+    return merged
+
+
 def split_into_scenes_contextual(
     text,
     words_per_scene=11,
@@ -160,26 +251,40 @@ def split_into_scenes_contextual(
         if target_split >= total:
             split_at = total
         else:
+            action_window_start = min(total, idx + 6)
+            action_window_end = min(total, target_split + lookahead + 1)
+            action_idx = _find_action_start(words, action_window_start, action_window_end)
+
             cue_window_end = min(total, target_split + lookahead + 1)
             cue_idx = _find_cue_index(words, target_split, cue_window_end)
+            punct_split = _find_punctuation_break(words, min_split, hard_split)
 
-            if cue_idx is not None and cue_idx >= min_split:
+            if action_idx is not None:
+                split_at = action_idx
+            elif punct_split is not None:
+                split_at = punct_split
+            elif cue_idx is not None and cue_idx >= min_split:
                 split_at = cue_idx
             else:
-                punct_split = _find_punctuation_break(words, min_split, hard_split)
-                split_at = punct_split if punct_split is not None else hard_split
+                split_at = hard_split
 
         if split_at <= idx:
             split_at = min(total, idx + words_per_scene)
             if split_at <= idx:
                 split_at = total
 
-        scene_text = " ".join(words[idx:split_at])
-        scenes.append(f"[SCENE {scene_number:03d}] {scene_text}")
-        scene_number += 1
+        scenes.append(words[idx:split_at])
         idx = split_at
 
-    return scenes
+    scenes = _merge_short_non_action_scenes(scenes, min_words=min_words)
+
+    formatted_scenes = []
+    for scene_words in scenes:
+        scene_text = " ".join(scene_words)
+        formatted_scenes.append(f"[SCENE {scene_number:03d}] {scene_text}")
+        scene_number += 1
+
+    return formatted_scenes
 
 
 def process_script(input_file, output_file=None, words_per_scene=11, mode="basic"):
